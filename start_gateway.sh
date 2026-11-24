@@ -36,14 +36,22 @@ fi
 echo "Logs streaming below (Ctrl+C to stop)."
 echo "------------------------------------------------------------"
 
+# Run in a new process group so we can kill the whole group on exit.
 # tee keeps a copy in data/logs/gateway.log while also printing to the terminal.
-# Process substitution lets us capture the real Python PID for the pidfile.
+set -o pipefail
 .venv/bin/python -m muse2api > >(tee data/logs/gateway.log) 2>&1 &
 APP_PID=$!
 echo "$APP_PID" > data/gateway.pid
 
-# Ensure the gateway is stopped if this script is interrupted.
-trap 'kill "$APP_PID" 2>/dev/null || true' INT TERM
+# Robust cleanup: kill the process group on any exit signal.
+cleanup() {
+    if [[ -n "${APP_PID:-}" ]]; then
+        kill -TERM -"$APP_PID" 2>/dev/null || true
+        sleep 0.2
+        kill -KILL -"$APP_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup INT TERM EXIT
 
 # Block in the foreground so the terminal stays attached to this instance.
 wait "$APP_PID"
