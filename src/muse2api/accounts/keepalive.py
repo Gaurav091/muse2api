@@ -51,7 +51,7 @@ async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float)
     while True:
         await asyncio.sleep(interval)
         for acc in pool.all():
-            if not acc.enabled:
+            if not acc.enabled or acc.status == AccountStatus.INVALID:
                 continue
             try:
                 result = await renew_account(pool, driver, acc.id)

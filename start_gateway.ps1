@@ -1,14 +1,6 @@
 <#
 .SYNOPSIS
-    Start the muse2api gateway (Windows native, PowerShell).
-
-.DESCRIPTION
-    Default: FOREGROUND — logs stream live in this console and the process is
-    tied to this task. Press Ctrl+C (or stop the task) to shut it down.
-    On every start, any previous instance is stopped first so only ONE runs.
-
-    Background (detached, logs to file only):
-        powershell -File start_gateway.ps1 -Background
+    Start the muse2api gateway with live log streaming and strict single-process cleanup (Windows native, PowerShell).
 #>
 param(
     [switch]$Background
@@ -20,49 +12,93 @@ $Port = 18610
 # Resolve repo root (this script lives at the repo root).
 Set-Location $PSScriptRoot
 
-Write-Host "[muse2api] Stopping any existing instance..." -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "          Starting muse2api Gateway (Single Instance)       " -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# 1. Strictly terminate ANY previous instance, orphan helper, or browser on 19210
 & "$PSScriptRoot\stop_gateway.ps1" | Out-Null
 
-# Ensure dirs exist and clear stale browser locks.
+# 2. Ensure dirs exist and clear stale browser locks.
 New-Item -ItemType Directory -Force -Path "data\logs", "data\browser-profile" | Out-Null
 Remove-Item "data\browser-profile\Singleton*" -Force -ErrorAction SilentlyContinue
+"" | Out-File -FilePath "data\logs\gateway.log" -Encoding utf8
 
-# Locate the Python interpreter (prefer repo venv).
+# 3. Locate the Python interpreter (prefer repo venv).
 $Python = "python"
 if (Test-Path ".venv\Scripts\python.exe") {
     $Python = ".venv\Scripts\python.exe"
 }
 
-Write-Host "[muse2api] Starting gateway on http://127.0.0.1:$Port..." -ForegroundColor Green
-Write-Host "[muse2api] Dashboard: http://127.0.0.1:$Port/dashboard"
+# 4. Start the gateway
+$proc = Start-Process -FilePath $Python `
+    -ArgumentList "-m", "muse2api" `
+    -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput "data\logs\gateway.log" `
+    -RedirectStandardError "data\logs\gateway.err.log"
+$proc.Id | Out-File -FilePath "data\gateway.pid" -Encoding ascii
 
-# --- Background mode (detached, logs to file only) --------------------------
+# 5. Wait up to 10 seconds for the gateway HTTP server to bind
+$bound = $false
+for ($i = 0; $i -lt 20; $i++) {
+    try {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/v1/models" -UseBasicParsing -TimeoutSec 1 -ErrorAction SilentlyContinue
+        if ($resp.StatusCode -eq 200) {
+            $bound = $true
+            break
+        }
+    } catch {
+        # Keep waiting
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+if ($bound) {
+    Write-Host "🟢 Gateway running with PID: $($proc.Id)" -ForegroundColor Green
+    Write-Host "🌐 API Base:   http://127.0.0.1:$Port/v1"
+    Write-Host "📊 Dashboard:  http://127.0.0.1:$Port/dashboard"
+    Write-Host "Logs: $PSScriptRoot\data\logs\gateway.log"
+
+    # Auto-verify active session and auto-recover if needed
+    & $Python -c @"
+import httpx, subprocess, sys
+
+ADMIN_KEY = 'sk-muse2api-admin-secret'
+try:
+    resp = httpx.get(
+        'http://127.0.0.1:$Port/admin/accounts',
+        headers={'Authorization': f'Bearer {ADMIN_KEY}'},
+        timeout=5.0
+    )
+    accounts = resp.json().get('data', [])
+    active = [a for a in accounts if a.get('status') == 'active' and a.get('enabled')]
+    if active:
+        lbl = active[0].get('label', 'primary')
+        print(f'✅ Session auto-grabbed: active account \"{lbl}\" loaded and ready for Hermes.')
+    else:
+        print('⚠️ No active session found. Auto-launching login recovery...')
+        subprocess.Popen([sys.executable, 'auto_login.py'])
+except Exception as e:
+    print(f'ℹ️ Gateway check note: {e}')
+"@
+} else {
+    Write-Host "❌ Gateway failed to bind within 10s. Check logs in data\logs\" -ForegroundColor Red
+    & "$PSScriptRoot\stop_gateway.ps1" | Out-Null
+    exit 1
+}
+
 if ($Background) {
-    $proc = Start-Process -FilePath $Python `
-        -ArgumentList "-m", "muse2api" `
-        -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput "data\logs\gateway.out.log" `
-        -RedirectStandardError "data\logs\gateway.err.log"
-    $proc.Id | Out-File -FilePath "data\gateway.pid" -Encoding ascii
-    Write-Host "[muse2api] Running in background with PID: $($proc.Id)"
-    Write-Host "[muse2api] Logs: $PSScriptRoot\data\logs\gateway.out.log"
+    Write-Host "Gateway running in background (-Background). Logs: $PSScriptRoot\data\logs\gateway.log"
     exit 0
 }
 
-# --- Foreground mode (default): stream logs live ----------------------------
-Write-Host "[muse2api] Logs streaming below (Ctrl+C to stop)." -ForegroundColor Yellow
+Write-Host "------------------------------------------------------------"
+Write-Host "📡 Live logs streaming below (Press Ctrl+C to stop gateway):" -ForegroundColor Yellow
 Write-Host "------------------------------------------------------------"
 
-# -NoNewWindow inherits this console so logs stream here; -PassThru gives us
-# the PID; we also record it so a later start can stop this instance.
-$proc = Start-Process -FilePath $Python `
-    -ArgumentList "-m", "muse2api" `
-    -PassThru -NoNewWindow
-$proc.Id | Out-File -FilePath "data\gateway.pid" -Encoding ascii
-
 try {
-    Wait-Process -Id $proc.Id
+    Get-Content -Path "data\logs\gateway.log" -Wait -Tail 30
 } finally {
-    # Ensure the gateway is stopped if this script is interrupted.
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Write-Host "`n[muse2api] Shutting down gateway cleanly..." -ForegroundColor Cyan
+    & "$PSScriptRoot\stop_gateway.ps1" | Out-Null
 }
