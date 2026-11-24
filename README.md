@@ -163,6 +163,28 @@ python -m muse2api        # listens on http://127.0.0.1:18610 by default
 
 If `MUSE2API_API_KEY` is not set, a key is generated on first start and saved to `data/api_key`.
 
+### Launcher scripts (macOS, Linux, Windows)
+
+Convenience wrappers that start/stop the gateway and guarantee a **single instance** (each start stops any previous one first). By default they run in the **foreground** and stream logs to the terminal; the terminal stays attached to this instance until you press `Ctrl+C`.
+
+**macOS / Linux**
+
+```bash
+bash ./start_gateway.sh              # foreground, logs stream here (Ctrl+C to stop)
+bash ./stop_gateway.sh               # stop the gateway
+BACKGROUND=1 bash ./start_gateway.sh # detached, logs -> data/logs/gateway.log
+```
+
+**Windows (PowerShell)**
+
+```powershell
+powershell -File start_gateway.ps1           # foreground, logs stream here (Ctrl+C to stop)
+powershell -File stop_gateway.ps1            # stop the gateway
+powershell -File start_gateway.ps1 -Background  # detached, logs -> data\logs\
+```
+
+Logs are written under `data/logs/` in all cases. Windows users can also run the `.sh` scripts via WSL or Git Bash.
+
 ### Docker
 
 ```bash
