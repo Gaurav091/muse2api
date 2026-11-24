@@ -329,7 +329,7 @@ class AccountPool:
         if error is None:
             acc.success_count += 1
             acc.last_error = None
-            if acc.status == AccountStatus.COOLING:
+            if acc.status in (AccountStatus.COOLING, AccountStatus.INVALID):
                 acc.status = AccountStatus.ACTIVE
             return
         acc.fail_count += 1

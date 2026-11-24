@@ -39,6 +39,8 @@ async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) 
     acc.cookie_expires.update(info.cookie_expires)
     acc.meta.update(info.meta)
     acc.meta["renewed_at"] = time.time()
+    acc.status = AccountStatus.ACTIVE
+    acc.last_error = None
     note_wake(acc, info.meta)
     await pool.upsert(acc)
     return {"ok": info.ok, "meta": info.meta}
@@ -49,10 +51,13 @@ async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float)
     while True:
         await asyncio.sleep(interval)
         for acc in pool.all():
-            if not acc.enabled or acc.status == AccountStatus.INVALID:
+            if not acc.enabled:
                 continue
             try:
                 result = await renew_account(pool, driver, acc.id)
                 log.info("keepalive %s -> %s", acc.id, result.get("ok"))
             except Exception:
-                log.exception("keepalive failed for %s", acc.id)
+                if acc.status != AccountStatus.INVALID:
+                    log.exception("keepalive failed for %s", acc.id)
+                else:
+                    log.debug("keepalive retry failed for invalid account %s", acc.id)

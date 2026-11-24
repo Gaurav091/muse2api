@@ -456,8 +456,13 @@ def _repo_check_command(low: str) -> str | None:
     """A combined repo health command when the user asks about muse2api checks."""
     if "muse2api" not in low:
         return None
-    if _mentions(low, ("sonar", "cc", "prefly", "pyrefly", "pylance",
-                        "check", "fix", "issue", "issues", "lint")):
+    if _mentions(
+        low,
+        (
+            "sonar", "cc", "prefly", "pyrefly", "pylance",
+            "check", "fix", "issue", "issues", "lint",
+        ),
+    ):
         return (
             f"cd {MUSE2API_ROOT} && {GIT_STATUS_SHORT} && "
             ".venv/bin/ruff check src tests && .venv/bin/pyrefly check src/ && "
@@ -751,13 +756,13 @@ def synthesize_tool_response(messages: list[dict[str, Any]]) -> str:
 
 
 try:
-    import workspace_helper
+    import workspace_helper  # pyright: ignore[reportMissingImports]
 except ImportError:
     _repo_root = Path(__file__).resolve().parents[3]
     if str(_repo_root) not in sys.path:
         sys.path.insert(0, str(_repo_root))
     try:
-        import workspace_helper
+        import workspace_helper  # pyright: ignore[reportMissingImports]
     except ImportError:
         workspace_helper = None  # type: ignore[assignment]
 
