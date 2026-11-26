@@ -341,6 +341,61 @@ async def test_named_reply_is_kept_for_the_next_turn(driver, fast, monkeypatch):
     assert account.meta["hot_page"]["hint"] == "k:alice"
 
 
+async def test_multi_bubble_reply_preserves_opening_of_second_bubble(driver, fast, monkeypatch):
+    """When muse.ai puts prose in bubble 1 and an action JSON in bubble 2, keep both intact."""
+    account = Account(id="a1", cookies={"hatch_sess": "x"})
+    tab = _Tab(account.id, "ctx", "t0", _FakeSession())  # type: ignore[arg-type]
+    tab.busy = True
+    states = iter([
+        {
+            "agentCount": 1,
+            "lastText": "Got the repo state — 53 modified files.",
+            "bubbleTexts": ["Got the repo state — 53 modified files."],
+            "generating": True,
+        },
+        {
+            "agentCount": 2,
+            "lastText": 'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+            "bubbleTexts": [
+                "Got the repo state — 53 modified files.",
+                'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+            ],
+            "generating": False,
+        },
+        {
+            "agentCount": 2,
+            "lastText": 'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+            "bubbleTexts": [
+                "Got the repo state — 53 modified files.",
+                'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+            ],
+            "generating": False,
+        },
+    ])
+    last_state = {"agentCount": 2, "generating": False,
+                  "lastText": 'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+                  "bubbleTexts": [
+                      "Got the repo state — 53 modified files.",
+                      'action\n[{"action": "shell", "args": {"command": "pytest -q"}}]',
+                  ]}
+
+    async def begin(acc, r):
+        return tab, {"agentCount": 0, "lastText": "", "bubbleTexts": []}
+
+    async def state(t):
+        return next(states, last_state)
+
+    monkeypatch.setattr(driver, "_begin_chat", begin)
+    monkeypatch.setattr(driver, "_state", state)
+    out = "".join([
+        d async for d in driver.chat_stream(
+            account, ChatRequest(prompt="go", model="muse-chat", turns=[("user", "go")]),
+        )
+    ])
+    assert "Got the repo state — 53 modified files." in out
+    assert '[{"action": "shell", "args": {"command": "pytest -q"}}]' in out
+
+
 async def test_anonymous_chat_does_not_restore_the_saved_thread(driver, monkeypatch):
     tab = _Tab(ACC.id, "ctx", "t0", _FakeSession())  # type: ignore[arg-type]
     account = Account(id="a2", cookies={"hatch_sess": "x"},

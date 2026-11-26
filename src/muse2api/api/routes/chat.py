@@ -18,6 +18,7 @@ from ...core.prompt import FlatPrompt, flatten_messages, message_turns
 from ...core.tools import (
     extract_tool_calls,
     is_refusal,
+    needs_tool_nudge,
     sanitize_response_text,
     synthesize_tool_response,
 )
@@ -116,11 +117,13 @@ def _tool_deltas(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+_CHUNK_OBJECT = "chat.completion.chunk"
+
 def _tool_calls_chunk(completion_id: str, created: int, model_name: str,
                       remaining: str, tool_calls: list[dict[str, Any]]) -> bytes:
     return _sse({
         "id": completion_id,
-        "object": "chat.completion.chunk",
+        "object": _CHUNK_OBJECT,
         "created": created,
         "model": model_name,
         "choices": [{
@@ -138,7 +141,7 @@ def _tool_calls_chunk(completion_id: str, created: int, model_name: str,
 def _tool_calls_finish(completion_id: str, created: int, model_name: str) -> bytes:
     return _sse({
         "id": completion_id,
-        "object": "chat.completion.chunk",
+        "object": _CHUNK_OBJECT,
         "created": created,
         "model": model_name,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
@@ -149,7 +152,7 @@ def _usage_chunk(completion_id: str, created: int, model_name: str,
                  prompt_text: str, completion_text: str) -> bytes:
     return _sse({
         "id": completion_id,
-        "object": "chat.completion.chunk",
+        "object": _CHUNK_OBJECT,
         "created": created,
         "model": model_name,
         "choices": [],
@@ -220,15 +223,116 @@ def _last_user_query_from_body(body: ChatCompletionRequest) -> str:
     return ""
 
 
+async def _run_nudge_once(
+    svc: Services,
+    body: ChatCompletionRequest,
+    request_hint: str | None,
+    raw_msgs: list[dict[str, Any]],
+    prior_reply: str,
+    nudge: str,
+    cancel: asyncio.Event | None,
+) -> str:
+    """Send one in-thread nudge turn to Muse and return its raw text."""
+    spec = resolve_model(body.model, "chat")
+    nudged_msgs = raw_msgs + [
+        {"role": "assistant", "content": prior_reply},
+        {"role": "user", "content": nudge},
+    ]
+    nudged_flat = flatten_messages(nudged_msgs, tools=body.tools)
+    turns = message_turns(raw_msgs) + [("assistant", prior_reply), ("user", nudge)]
+    req = ChatRequest(
+        prompt=nudged_flat.text or nudge,
+        model=spec.id,
+        images=[],
+        timeout=svc.settings.chat_timeout,
+        first_token_timeout=svc.settings.first_token_timeout,
+        conversation_hint=request_hint,
+        turns=turns,
+        cancel=cancel or asyncio.Event(),
+    )
+    return "".join([d async for d in svc.gateway.chat_stream(req)])
+
+
+def _latest_user_text(body: ChatCompletionRequest) -> str:
+    """Return the most recent non-empty user message text, even after tool turns."""
+    for m in reversed(body.messages):
+        if m.role == "user":
+            text = _user_text_from_message(m)
+            if text:
+                return text
+    return ""
+
+
+def _fallback_from_candidates(
+    candidates: tuple[str, ...],
+    tool_names: list[str],
+    effective_q: str,
+) -> tuple[list[dict[str, Any]], str | None, str] | None:
+    """Try synthesizing fallback tool calls from candidate responses."""
+    if not effective_q:
+        return None
+    for candidate in candidates:
+        calls, rem = extract_tool_calls(candidate, tool_names, user_query=effective_q)
+        if calls:
+            return calls, rem, candidate
+    return None
+
+
+async def _try_tool_nudge(
+    svc: Services,
+    body: ChatCompletionRequest,
+    request_hint: str | None,
+    produced: str,
+    user_q: str,
+    cancel: asyncio.Event | None = None,
+) -> tuple[list[dict[str, Any]] | None, str | None, str]:
+    """If Muse promised a tool call, refused, or faked an edit in prose, nudge in-thread."""
+    raw_msgs = [m.model_dump() for m in body.messages]
+    tool_names = _available_tool_names(body)
+    nudge = needs_tool_nudge(produced, raw_msgs, tool_names)
+    if not nudge:
+        return None, None, produced
+
+    log.info("tool_nudge triggered (produced len=%d)", len(produced))
+    nudged_text = await _run_nudge_once(svc, body, request_hint, raw_msgs, produced, nudge, cancel)
+
+    calls, remaining = extract_tool_calls(nudged_text, tool_names, user_query=user_q)
+    if calls:
+        return calls, remaining, nudged_text
+
+    if is_refusal(nudged_text) and (retry_nudge := needs_tool_nudge(nudged_text, raw_msgs, tool_names)):
+        log.info("tool_nudge retry after refusal (len=%d)", len(nudged_text))
+        nudged_text = await _run_nudge_once(
+            svc, body, request_hint, raw_msgs, nudged_text, retry_nudge, cancel,
+        )
+        calls, remaining = extract_tool_calls(nudged_text, tool_names, user_query=user_q)
+        if calls:
+            return calls, remaining, nudged_text
+
+    fb = _fallback_from_candidates((nudged_text, produced), tool_names, user_q or _latest_user_text(body))
+    if fb is not None:
+        return fb
+
+    if nudged_text.strip() and not is_refusal(nudged_text):
+        return None, None, nudged_text
+
+    return None, None, produced
+
+
 async def _non_streaming(stream: AsyncIterator[str], body: ChatCompletionRequest,
-                         flat: FlatPrompt, ids: _CompletionIds) -> dict[str, Any]:
+                         flat: FlatPrompt, ids: _CompletionIds,
+                         svc: Services | None = None,
+                         hint: str | None = None) -> dict[str, Any]:
     """Non-streaming completion, with optional tool-call reconstruction."""
     text = "".join([d async for d in stream])
     user_q = _last_user_query_from_body(body)
     if body.tools:
-        tool_calls, remaining = extract_tool_calls(
-            text, _available_tool_names(body), user_query=user_q,
-        )
+        tool_names = _available_tool_names(body)
+        tool_calls, remaining = extract_tool_calls(text, tool_names)
+        if not tool_calls and svc is not None:
+            tool_calls, remaining, text = await _try_tool_nudge(svc, body, hint, text, user_q)
+        elif not tool_calls and user_q:
+            tool_calls, remaining = extract_tool_calls(text, tool_names, user_query=user_q)
         if tool_calls:
             return _tool_calls_payload(ids, sanitize_response_text(remaining or ""),
                                        tool_calls, flat.text)
@@ -263,9 +367,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
 
     ids = _CompletionIds(completion_id, created, model_name)
     if not body.stream:
-        return await _non_streaming(stream, body, flat, ids)
+        return await _non_streaming(stream, body, flat, ids, svc=svc, hint=req.conversation_hint)
 
-    return await _streaming(stream, _StreamCtx(svc, body, flat, ids, cancel))
+    return await _streaming(stream, _StreamCtx(svc, body, flat, ids, cancel, req.conversation_hint))
 
 
 @dataclass(frozen=True)
@@ -284,12 +388,13 @@ class _StreamCtx:
     flat: FlatPrompt
     ids: _CompletionIds
     cancel: asyncio.Event
+    conversation_hint: str | None = None
 
 
 def _chunk(ids: _CompletionIds, delta: dict[str, Any],
            finish: str | None = None) -> dict[str, Any]:
     return {
-        "id": ids.completion_id, "object": "chat.completion.chunk",
+        "id": ids.completion_id, "object": _CHUNK_OBJECT,
         "created": ids.created, "model": ids.model_name,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
     }
@@ -304,9 +409,11 @@ async def _stream_tools(stream: AsyncIterator[str], ctx: _StreamCtx,
     user_q = _last_user_query_from_body(ctx.body)
     log.info("_stream_tools: produced len=%d, user_q=%r, text_preview=%r",
              len(produced), user_q, produced[:100])
-    tool_calls, remaining = extract_tool_calls(
-        produced, _available_tool_names(ctx.body), user_query=user_q,
-    )
+    tool_calls, remaining = extract_tool_calls(produced, _available_tool_names(ctx.body))
+    if not tool_calls:
+        tool_calls, remaining, produced = await _try_tool_nudge(
+            ctx.svc, ctx.body, ctx.conversation_hint, produced, user_q, ctx.cancel,
+        )
     if tool_calls:
         clean_remaining = sanitize_response_text(remaining or "")
         yield _tool_calls_chunk(ctx.ids.completion_id, ctx.ids.created, ctx.ids.model_name,

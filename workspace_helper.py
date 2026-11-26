@@ -457,37 +457,45 @@ def build_context_for_paths(
     paths: list[Path],
     prompt: str = "",
     max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    *,
+    tool_mode: bool = False,
 ) -> str:
     """Build a structured context block from local files or directories."""
     base = get_default_workspace(prompt)
-    blocks = [
-        "[Autonomous Agent Mode Active — Direct Multi-Drive Host Access]",
-        "Host: macOS",
-        "Accessible Workspaces:",
-        "- Main Drive: /Users/Gaurav_Batra/muse2api",
-        "- D Drive: /Volumes/Drive D/Indian Firm/Ai-indian-trading-firm",
-        f"Active Target Root: {base}",
-        "You have direct write and edit access to the local codebase through the terminal bridge.",
-        "When asked to fix bugs, refactor, implement features, or edit files:",
-        "1. Always specify the relative target file path in your code block header or before it:",
-        "   ```python:path/to/file.py",
-        "   <full corrected file content or replacement>",
-        "   ```",
-        "   Or use: `### File: path/to/file.py` immediately followed by the code block.",
-        "2. The bridge automatically writes your code directly to disk upon completion.",
-        "   The user will immediately see the changes in their Git Source Control / Changes tab.",
-        "3. NEVER say 'I cannot write directly to your Mac' or tell the "
-        "user to manually run '/save'.",
-        "   Confirm that the file has been edited on disk for the user to "
-        "review in Source Control.",
-        "4. CRITICAL REPOSITORY CODING RULES:",
-        "   - STRICTLY PROHIBITED: `from __future__ import annotations` "
-        "(deprecated in Python 3.14+).",
-        "   - Hard cap: <= 250 lines per .py file.",
-        "   - Zero floating-point equality (== or != against floats). "
-        "Use thresholds or math.isclose.",
-        "   - Flake8 compliance: max line length 100 characters.",
-    ]
+    if tool_mode:
+        blocks = [
+            f"Target workspace root: {base}",
+            "(All file/command actions are executed locally on disk by the client.)",
+        ]
+    else:
+        blocks = [
+            "[Autonomous Agent Mode Active — Direct Multi-Drive Host Access]",
+            "Host: macOS",
+            "Accessible Workspaces:",
+            "- Main Drive: /Users/Gaurav_Batra/muse2api",
+            "- D Drive: /Volumes/Drive D/Indian Firm/Ai-indian-trading-firm",
+            f"Active Target Root: {base}",
+            "You have direct write and edit access to the local codebase through the terminal bridge.",
+            "When asked to fix bugs, refactor, implement features, or edit files:",
+            "1. Always specify the relative target file path in your code block header or before it:",
+            "   ```python:path/to/file.py",
+            "   <full corrected file content or replacement>",
+            "   ```",
+            "   Or use: `### File: path/to/file.py` immediately followed by the code block.",
+            "2. The bridge automatically writes your code directly to disk upon completion.",
+            "   The user will immediately see the changes in their Git Source Control / Changes tab.",
+            "3. NEVER say 'I cannot write directly to your Mac' or tell the "
+            "user to manually run '/save'.",
+            "   Confirm that the file has been edited on disk for the user to "
+            "review in Source Control.",
+            "4. CRITICAL REPOSITORY CODING RULES:",
+            "   - STRICTLY PROHIBITED: `from __future__ import annotations` "
+            "(deprecated in Python 3.14+).",
+            "   - Hard cap: <= 250 lines per .py file.",
+            "   - Zero floating-point equality (== or != against floats). "
+            "Use thresholds or math.isclose.",
+            "   - Flake8 compliance: max line length 100 characters.",
+        ]
     if prompt:
         git_ctx = get_git_context(base, prompt)
         if git_ctx:

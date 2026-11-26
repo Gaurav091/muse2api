@@ -743,6 +743,16 @@ class BrowserDriver(MuseDriver):
         got_first: bool = False
 
     @staticmethod
+    def _reply_text(st: dict[str, Any], base_count: int) -> str:
+        """Full reply across all new assistant bubbles created after ``base_count``."""
+        bubble_texts = st.get("bubbleTexts")
+        if isinstance(bubble_texts, list) and len(bubble_texts) > base_count:
+            joined = "\n\n".join(str(t) for t in bubble_texts[base_count:] if t)
+            if joined:
+                return joined
+        return st.get("lastText", "")
+
+    @staticmethod
     def _delta_after(text: str, previous: str) -> str:
         if not previous:
             return text
@@ -757,6 +767,10 @@ class BrowserDriver(MuseDriver):
             common += 1
         if common >= int(len(previous) * 0.5):
             return text[common:]
+        # A brand-new replacement bubble (no shared prefix with previous) — emit the full new text
+        # rather than slicing at len(previous) which drops its opening lines.
+        if not common and text != previous:
+            return f"\n\n{text}"
         if len(text) > len(previous):
             return text[len(previous):]
         return ""
@@ -773,7 +787,7 @@ class BrowserDriver(MuseDriver):
         if st.get("approval"):
             await self._deny_approvals(tab)
             return state, False, None
-        text = st.get("lastText", "")
+        text = self._reply_text(st, state.base_count)
         is_new_bubble = st.get("agentCount", 0) > state.base_count
         has_new_text = bool(text and (is_new_bubble or text != state.base_text))
         if not has_new_text:

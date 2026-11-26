@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 TRADING_FIRM_ROOT = "/Volumes/Drive D/Indian Firm/Ai-indian-trading-firm"
 MUSE2API_ROOT = "/Users/Gaurav_Batra/muse2api"
 GIT_STATUS_SHORT = "git status -s"
+_GIT_STATUS = "git status"
 
 _DICT_STR_ANY: TypeAlias = dict[str, Any]
 _LIST_ANY: TypeAlias = list[Any]
@@ -42,22 +43,27 @@ _GIT_WORDS = ("git", "commit", "commits", "diff", "branch", "repo", "repository"
 _CODE_WORDS = ("test", "tests", "pytest", "refactor", "function", "class",
                "module", "code", "file", "files")
 
-_TOOL_ALIASES = {
-    "bash": "terminal",
-    "sh": "terminal",
-    "shell": "terminal",
-    "exec": "terminal",
-    "cmd": "terminal",
-    "run": "terminal",
-    "read": "read_file",
-    "cat": "read_file",
-    "write": "write_file",
+_TOOL_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("terminal", "shell", "bash", "sh", "exec", "execute", "execute_command",
+     "run_command", "cmd", "run"),
+    ("read_file", "read", "cat", "view_file"),
+    ("write_file", "write", "create_file", "save_file"),
+    ("patch", "edit", "edit_file", "apply_patch", "str_replace", "replace"),
+    ("search_files", "grep", "ripgrep", "rg"),
+    ("glob", "find", "find_files", "list_files"),
+)
+
+_TOOL_GROUP_BY_NAME: dict[str, tuple[str, ...]] = {
+    alias: group
+    for group in _TOOL_GROUPS
+    for alias in group
 }
 
 _REFUSAL_SIGNALS = (
     "web side chat",
     "in this web chat",
     "not in this chat",
+    "not done in this chat",
     "from this chat",
     "/home/hatch",
     "~/workspace",
@@ -76,6 +82,30 @@ _REFUSAL_SIGNALS = (
     "not a tool call in this chat",
     "this vm is",
     "this chat, gaurav",
+    "can't do the whole repo",
+    "cannot do the whole repo",
+    "in this chat, and i won't",
+    "did not verify that here",
+    "didn't verify that here",
+    "cannot verify that here",
+    "cannot run commands in this chat",
+    "can't run commands in this chat",
+    "no local file access",
+    "no shell access",
+    "no terminal access",
+    "can't inspect local",
+    "cannot inspect local",
+    "i need to correct my last",
+    "i need to correct the",
+    "not the injected",
+    "whole repo: not checked",
+    "with my own tool runs",
+    "my own tools",
+    "i re-checked in this chat",
+    "i won't emit that",
+    "not outputting an action block",
+    "don't have a client-executed",
+    "ran into a problem while responding",
 )
 
 _XML_OPEN = "<tool_call>"
@@ -92,9 +122,28 @@ _BASE_GIT_RE = re.compile(
 _WORKSPACE_FILE_RE = re.compile(r"\b[a-zA-Z0-9_\-./]+\.(?:py|json|toml|md|sh|yaml|yml)\b")
 
 
-def _format_tool_lines(tool: dict[str, Any]) -> list[str]:
+_CORE_CODING_TOOLS = frozenset({
+    "terminal", "shell", "bash", "read_file", "read", "write_file", "write",
+    "patch", "edit", "edit_file", "search_files", "grep", "glob",
+    "execute_code", "execute", "delegate_task", "clarify", "web_search", "web_extract",
+})
+
+
+def _format_param_line(p_name: str, p_spec: dict[str, Any], req_list: list[Any], compact: bool) -> str:
+    """Render a single parameter line for a tool definition."""
+    spec = p_spec if isinstance(p_spec, dict) else {}
+    ptype = spec.get("type", "any")
+    pdesc = str(spec.get("description", "") or "")
+    if compact and len(pdesc) > 140:
+        pdesc = pdesc[:140].rstrip() + "..."
+    req_tag = " (required)" if p_name in req_list else ""
+    return f"    * {p_name} ({ptype}{req_tag}): {pdesc}"
+
+
+def _format_tool_lines(tool: dict[str, Any], *, compact: bool = False) -> list[str]:
     """Render the prompt lines for a single tool definition."""
     fn = cast(_DICT_STR_ANY, tool.get("function", tool))
+    name = str(fn.get("name", ""))
     params = cast(_DICT_STR_ANY, fn.get("parameters", {}))
     props = cast(_DICT_STR_ANY, params.get("properties", {}))
     req_raw: Any = params.get("required", [])
@@ -102,8 +151,14 @@ def _format_tool_lines(tool: dict[str, Any]) -> list[str]:
     if isinstance(req_raw, list):
         req_list = cast(_LIST_ANY, req_raw)
 
-    lines = [f"- Tool: `{fn.get('name', '')}`"]
-    desc = fn.get("description", "")
+    if compact and name.lower() not in _CORE_CODING_TOOLS:
+        p_keys = ", ".join(props.keys())
+        return [f"- Tool: `{name}`" + (f" (params: {p_keys})" if p_keys else "")]
+
+    lines = [f"- Tool: `{name}`"]
+    desc = str(fn.get("description", "") or "")
+    if compact and len(desc) > 220:
+        desc = desc[:220].rstrip() + "..."
     if desc:
         lines.append(f"  Description: {desc}")
     if not props:
@@ -111,87 +166,229 @@ def _format_tool_lines(tool: dict[str, Any]) -> list[str]:
 
     lines.append("  Parameters:")
     for p_name, p_spec in props.items():
-        spec = cast(_DICT_STR_ANY, p_spec) if isinstance(p_spec, dict) else {}
-        ptype = spec.get("type", "any")
-        pdesc = spec.get("description", "")
-        req_tag = " (required)" if p_name in req_list else ""
-        lines.append(f"    * {p_name} ({ptype}{req_tag}): {pdesc}")
+        lines.append(_format_param_line(p_name, p_spec, req_list, compact))
     return lines
 
 
+def _tool_names(tools: list[dict[str, Any]]) -> list[str]:
+    """Return non-empty declared tool names in declaration order."""
+    out: list[str] = []
+    for t in tools:
+        fn = cast(_DICT_STR_ANY, t.get("function", t))
+        name = str(fn.get("name", "")).strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _pick_tool(available_tools: list[str] | None, canonical: str) -> str | None:
+    """Pick the client tool name matching ``canonical`` (or one of its aliases)."""
+    if not available_tools:
+        return None
+    names_map = {t.lower(): t for t in available_tools}
+    low = canonical.lower()
+    if low in names_map:
+        return names_map[low]
+    group = _TOOL_GROUP_BY_NAME.get(low)
+    if not group:
+        return None
+    for candidate in group:
+        if candidate in names_map:
+            return names_map[candidate]
+    return None
+
+
+def _preferred_action_tools(tool_names: list[str]) -> list[str]:
+    """Ordered subset of client action tools (shell/read/search/edit/write)."""
+    picks: list[str] = []
+    for canonical in ("terminal", "read_file", "glob", "search_files", "patch", "write_file"):
+        t = _pick_tool(tool_names, canonical)
+        if t and t not in picks:
+            picks.append(t)
+    return picks or tool_names[:6]
+
+
+def format_tool_reminder(tools: list[dict[str, Any]]) -> str:
+    """Short end-of-prompt reminder naming active tools and the ```action JSON syntax."""
+    names = _tool_names(tools)
+    if not names:
+        return ""
+    action = _preferred_action_tools(names)
+    example_tool = _pick_tool(names, "terminal") or action[0]
+    example_args = '{"command": "<cmd>"}' if example_tool in ("terminal", "shell", "bash") else "{}"
+    edit_tools = [t for c in ("patch", "write_file") if (t := _pick_tool(names, c))]
+    edit_str = " or ".join(f"`{t}`" for t in edit_tools) if edit_tools else _EDIT_WRITE_TOOL_PHRASE
+    return (
+        f"Available tools: {', '.join(f'`{t}`' for t in action)}. "
+        "CRITICAL: NEVER run your own built-in/cloud sandbox tools to check local Mac paths "
+        "(they are not mounted in your container). "
+        "Use ONLY ```action JSON blocks for client execution, or answer directly from the "
+        "Client Execution Output already returned above. "
+        "When you need to inspect, search, edit, or test anything, reply ONLY with a JSON block "
+        "in ```action ... ``` (for example: "
+        f'{{"action": "{example_tool}", "args": {example_args}}}). '
+        f"Only report files edited after {edit_str} returns a success result, "
+        "and keep chaining steps until the entire task is verified complete."
+    )
+
+
 def format_tools_prompt(tools: list[dict[str, Any]]) -> str:
-    """Format OpenAI tool definitions into prompt instructions for muse."""
+    """Format OpenAI tool definitions into a collaborative client-runner workflow prompt."""
     if not tools:
         return ""
 
+    names = _tool_names(tools)
+    action = _preferred_action_tools(names)
+    edit_tools = [t for c in ("patch", "write_file") if (t := _pick_tool(names, c))]
+    edit_examples = " or ".join(f"`{t}`" for t in edit_tools) or _EDIT_WRITE_TOOL_PHRASE
+    example_tool = _pick_tool(names, "terminal") or (action[0] if action else "shell")
+    example_args = (
+        '{"command": "git status -s"}'
+        if example_tool in ("terminal", "shell", "bash")
+        else '{"path": "README.md"}'
+    )
+
     lines = [
-        "[Host Environment & Multi-Drive Filesystem Access — Available Tools]",
-        ("You are operating with direct access to local execution tools on the user's "
-         "macOS host machine."),
-        "You have full access across BOTH the primary main drive and external volumes:",
-        "1. Main Drive Workspace (Local User Root):",
-        "   - Base: /Users/Gaurav_Batra",
-        f"   - Repositories: {MUSE2API_ROOT} (the Muse2API gateway repo)",
-        "2. D Drive Workspace (External Volume):",
-        f"   - Base: {TRADING_FIRM_ROOT}",
-        "   - Trading system: options_trading, tests, scripts, docs",
+        "### Available Tools (Client-Executed Local Workflow)",
+        ("We are collaborating in a human-in-the-loop coding workflow. You do NOT have direct "
+         "local access and should NOT run bash in your own remote sandbox or pretend to execute "
+         "anything yourself."),
+        ("Instead, the client executes any ```action JSON block you output locally on the "
+         "repository and returns the real output on the next turn."),
         "",
-        "CRITICAL OPERATING RULES:",
-        ("- NEVER claim that /Volumes/Drive D is not mounted, that you are in a web chat, "
-         "or that you are in ~/workspace or /home/hatch."),
-        "- NEVER refuse a request by claiming you lack access to files or directories.",
-        f"- When asked about 'muse2api', inspect {MUSE2API_ROOT}.",
-        f"- When asked about the trading firm, inspect {TRADING_FIRM_ROOT}.",
-        ("- If you need to inspect files, check git, or run quality checks "
-         "(sonar, flake8, ruff, pytest, pylance, radon/CC), INVOKE THE APPROPRIATE "
-         "TOOL IMMEDIATELY (e.g. `terminal` or `read_file`)!"),
+        "Workspace repositories:",
+        f"- {MUSE2API_ROOT} (Muse2API gateway repo)",
+        f"- {TRADING_FIRM_ROOT} (Trading firm repo)",
         "",
-        "Tools available to invoke:",
+        "Declared tools & parameters:",
         "",
     ]
 
+    compact = len(tools) > 12
+    extra_names: list[str] = []
     for t in tools:
-        lines.extend(_format_tool_lines(t))
+        fn = cast(_DICT_STR_ANY, t.get("function", t))
+        t_name = str(fn.get("name", ""))
+        if compact and t_name.lower() not in _CORE_CODING_TOOLS:
+            if t_name:
+                extra_names.append(f"`{t_name}`")
+            continue
+        lines.extend(_format_tool_lines(t, compact=compact))
+        if not compact:
+            lines.append("")
+    if extra_names:
+        lines.append(f"- Other optional tools: {', '.join(extra_names)}")
         lines.append("")
 
     lines.extend([
-        "[Tool Calling Instructions]",
-        "When the user asks to run commands, run tests, check git, inspect files, or make edits:",
-        "1. You MUST invoke an available tool. Do NOT assume commands cannot be run.",
-        "2. To invoke a tool, output a tool call block in EXACTLY this format:",
-        "<tool_call>",
-        '{"name": "<tool_name>", "arguments": {<arguments>}}',
-        "</tool_call>",
-        "3. You can also format as a JSON code block:",
-        "```json",
-        '{"tool_calls": [{"name": "<tool_name>", "arguments": {<arguments>}}]}',
+        "### Workflow Rules",
+        "1. Whenever you need to inspect files, search, run commands/tests/linters, or edit/write "
+        "files on the user's Mac, output ONLY a JSON block in ```action ... ```:",
+        "```action",
+        f'{{"action": "{example_tool}", "args": {example_args}}}',
         "```",
-        ("4. The runtime executes your tool call on the host machine and returns the result "
-         "in a `[Tool Result]` block."),
-        ("5. When you see a `[Tool Result]` block, you MUST use its contents as the ground-truth "
-         "execution output from the host machine to formulate your answer to the user."),
-        ("6. NEVER dispute the tool output or claim that you cannot verify it. "
-         "Summarize and explain the tool output directly to the user."),
-        "7. When all needed information is already in context, answer directly.",
+        "2. You may also output multiple actions as a JSON array when inspecting multiple items:",
+        "```action",
+        f'[{{"action": "{example_tool}", "args": {example_args}}}]',
+        "```",
+        "3. After each `Client Execution Output` arrives, review it and emit the next "
+        "```action block(s) to continue (inspect -> read -> edit -> run tests/checks -> verify).",
+        f"4. Never claim a file was edited unless {edit_examples} succeeded in `Client Execution "
+        "Output`, and never paste full-file markdown dumps instead of calling edit/write.",
+        "5. Do not stop after 1 read/status check when fixes or full-repo checks were requested — "
+        "keep emitting ```action blocks across turns until all fixes and checks are verified.",
+        "6. Only after everything requested is verified complete, write the final response in "
+        "plain markdown with NO ```action block.",
     ])
     return "\n".join(lines)
 
 
 def _normalize_tool_name(name: str, available_tools: list[str] | None) -> str | None:
-    """Map tool name aliases (e.g. bash -> terminal) or check validity."""
+    """Map tool name aliases bidirectionally (e.g. bash<->shell<->terminal) or check validity."""
     if not name:
         return None
     if not available_tools:
         return name
+    return _pick_tool(available_tools, name)
 
-    names_map = {t.lower(): t for t in available_tools}
-    low = name.lower()
-    if low in names_map:
-        return names_map[low]
-    alias = _TOOL_ALIASES.get(low)
-    if alias is not None and alias.lower() in names_map:
-        return names_map[alias.lower()]
-    return None
+
+def _adapt_cmd_args(norm_name: str, adapted: dict[str, Any]) -> dict[str, Any]:
+    """Normalize shell/terminal argument names to `command`."""
+    low = norm_name.lower()
+    if low not in ("shell", "terminal", "bash", "sh") or "command" in adapted:
+        return adapted
+    for alt in ("cmd", "script", "code"):
+        if isinstance(adapted.get(alt), str):
+            adapted["command"] = adapted.pop(alt)
+            break
+    return adapted
+
+
+def _adapt_path_args(norm_name: str, adapted: dict[str, Any]) -> dict[str, Any]:
+    """Normalize read/write/edit argument names to `path`."""
+    low = norm_name.lower()
+    if low not in ("read", "read_file", "write", "write_file", "edit", "edit_file", "patch") or "path" in adapted:
+        return adapted
+    for alt in ("file_path", "filePath", "filepath", "file"):
+        if isinstance(adapted.get(alt), str):
+            adapted["path"] = adapted.pop(alt)
+            break
+    return adapted
+
+
+def _adapt_edit_args(adapted: dict[str, Any]) -> dict[str, Any]:
+    """Rename snake_case edit keys to camelCase."""
+    for src, dst in (("old_string", "oldString"), ("new_string", "newString"),
+                     ("replace_all", "replaceAll")):
+        if dst not in adapted and src in adapted:
+            adapted[dst] = adapted.pop(src)
+    return adapted
+
+
+def _adapt_patch_args(adapted: dict[str, Any]) -> dict[str, Any]:
+    """Rename camelCase patch keys to snake_case."""
+    for src, dst in (("oldString", "old_string"), ("newString", "new_string"),
+                     ("replaceAll", "replace_all")):
+        if dst not in adapted and src in adapted:
+            adapted[dst] = adapted.pop(src)
+    return adapted
+
+
+def _adapt_search_files_args(adapted: dict[str, Any]) -> dict[str, Any]:
+    """Rename `include` to `file_glob` for search_files."""
+    if "file_glob" not in adapted and isinstance(adapted.get("include"), str):
+        adapted["file_glob"] = adapted.pop("include")
+    return adapted
+
+
+def _adapt_grep_args(adapted: dict[str, Any]) -> dict[str, Any]:
+    """Rename `file_glob` to `include` for grep."""
+    if "include" not in adapted and isinstance(adapted.get("file_glob"), str):
+        adapted["include"] = adapted.pop("file_glob")
+    return adapted
+
+
+def _adapt_string_args(norm_name: str, adapted: dict[str, Any]) -> dict[str, Any]:
+    """Normalize edit (camelCase) vs patch (snake_case) and search_files/grep parameters."""
+    low = norm_name.lower()
+    if low in ("edit", "edit_file"):
+        return _adapt_edit_args(adapted)
+    if low == "patch":
+        return _adapt_patch_args(adapted)
+    if low == "search_files":
+        return _adapt_search_files_args(adapted)
+    if low == "grep":
+        return _adapt_grep_args(adapted)
+    return adapted
+
+
+def _adapt_tool_args(norm_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common cross-harness argument names (e.g. file_path -> path, cmd -> command)."""
+    adapted = dict(args)
+    adapted = _adapt_cmd_args(norm_name, adapted)
+    adapted = _adapt_path_args(norm_name, adapted)
+    adapted = _adapt_string_args(norm_name, adapted)
+    return adapted
 
 
 def _safe_json_loads(text: str) -> Any | None:
@@ -211,7 +408,8 @@ def _build_call_entry(
         return None
 
     if isinstance(args, dict):
-        args_str = json.dumps(args, ensure_ascii=False)
+        adapted = _adapt_tool_args(norm_name, cast(_DICT_STR_ANY, args))
+        args_str = json.dumps(adapted, ensure_ascii=False)
     elif isinstance(args, str):
         args_str = args
     else:
@@ -227,24 +425,38 @@ def _build_call_entry(
     }
 
 
-def _single_tool_entry(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """A bare {name, arguments} payload, or None when it carries tool_calls."""
-    raw_calls = payload.get("tool_calls")
-    if isinstance(raw_calls, list) or "name" not in payload:
+_ACTION_META_KEYS = frozenset({"name", "action", "tool"})
+_ACTION_ARGS_KEYS = ("arguments", "args", "input", "parameters")
+
+
+def _extract_dict_entry(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a single action/tool dict ({name|action|tool, arguments|args|input|...})."""
+    tool_name = next(
+        (payload[k] for k in ("name", "action", "tool") if isinstance(payload.get(k), str)),
+        None,
+    )
+    if not tool_name:
         return None
-    args: Any = payload.get("arguments", payload.get("parameters", {}))
-    return [{"name": payload["name"], "arguments": args}]
+    for arg_k in _ACTION_ARGS_KEYS:
+        if arg_k in payload:
+            return {"name": tool_name, "arguments": payload[arg_k]}
+    extra_args = {k: v for k, v in payload.items() if k not in _ACTION_META_KEYS}
+    return {"name": tool_name, "arguments": extra_args}
+
+
+def _single_tool_entry(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """A single {name|action|tool, ...} payload, or None when it carries a batch list."""
+    if isinstance(payload.get("tool_calls"), list) or isinstance(payload.get("actions"), list):
+        return None
+    entry = _extract_dict_entry(payload)
+    return [entry] if entry is not None else None
 
 
 def _entry_from_item(tc: Any) -> dict[str, Any] | None:
     """Normalize one tool-call item; None when it is not usable."""
-    if not isinstance(tc, dict) or "name" not in tc:
+    if not isinstance(tc, dict):
         return None
-    t = cast(_DICT_STR_ANY, tc)
-    return {
-        "name": t["name"],
-        "arguments": t.get("arguments", t.get("parameters", {})),
-    }
+    return _extract_dict_entry(cast(_DICT_STR_ANY, tc))
 
 
 def _tool_list_items(data: Any) -> list[Any]:
@@ -254,8 +466,11 @@ def _tool_list_items(data: Any) -> list[Any]:
     if not isinstance(data, dict):
         return []
     payload = cast(_DICT_STR_ANY, data)
-    raw_calls = payload.get("tool_calls")
-    return cast(_LIST_ANY, raw_calls) if isinstance(raw_calls, list) else []
+    for key in ("tool_calls", "actions"):
+        raw_calls = payload.get(key)
+        if isinstance(raw_calls, list):
+            return cast(_LIST_ANY, raw_calls)
+    return []
 
 
 def _tool_entries(data: Any) -> list[dict[str, Any]]:
@@ -302,26 +517,30 @@ def _xml_blocks(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _json_code_blocks(text: str) -> list[tuple[int, int]]:
-    """Non-overlapping spans of ```json … ``` blocks whose body is JSON.
+def _fence_lang_end(text: str, body_start: int) -> int:
+    """Advance past an optional ```json / ```action language tag."""
+    for lang in ("action", "json"):
+        if text.startswith(lang, body_start):
+            tag_end = body_start + len(lang)
+            if tag_end >= len(text) or text[tag_end].isspace():
+                return tag_end
+    return body_start
 
-    Deterministic linear scan (``str.find``) — no lazy/overlapping quantifiers.
-    """
+
+def _json_code_blocks(text: str) -> list[tuple[int, int]]:
+    """Non-overlapping spans of ```json / ```action blocks whose body is JSON."""
     spans: list[tuple[int, int]] = []
     pos = 0
     while True:
         start = text.find(_FENCE, pos)
         if start < 0:
             break
-        body_start = start + len(_FENCE)
-        if text.startswith("json", body_start):
-            tag_end = body_start + len("json")
-            if tag_end >= len(text) or text[tag_end].isspace():
-                body_start = tag_end
+        body_start = _fence_lang_end(text, start + len(_FENCE))
         end = text.find(_FENCE, body_start)
         if end < 0:
             break
-        if text[body_start:end].strip().startswith("{"):
+        body = text[body_start:end].strip()
+        if body.startswith(("{", "[")):
             spans.append((start, end + len(_FENCE)))
         pos = end + len(_FENCE)
     return spans
@@ -333,8 +552,9 @@ def _xml_content(text: str, start: int, end: int) -> str:
 
 def _fence_content(text: str, start: int, end: int) -> str:
     inner = text[start + len(_FENCE):end - len(_FENCE)].strip()
-    if inner.startswith("json"):
-        inner = inner[len("json"):].lstrip()
+    for lang in ("action", "json"):
+        if inner.startswith(lang) and (len(inner) == len(lang) or inner[len(lang)].isspace()):
+            return inner[len(lang):].lstrip()
     return inner
 
 
@@ -405,8 +625,10 @@ def _recent_commit_count(low: str) -> str:
 
 
 def _git_request_kind(low: str) -> str | None:
-    """Classify a git request as status / log / both, else None."""
-    wants_status = _mentions(low, ("status", "git status"))
+    """Classify a git request as status / log / diff / both, else None."""
+    if _mentions(low, ("uncommitted", "uncommited")):
+        return "uncommitted"
+    wants_status = _mentions(low, ("status", _GIT_STATUS))
     wants_log = _mentions(low, ("commit", "git log", "log"))
     if wants_status and wants_log:
         return "status_log"
@@ -442,6 +664,8 @@ def _clean_git_command(user_query: str) -> str | None:
     low = user_query.lower()
     prefix = _git_workspace_prefix(low)
     kind = _git_request_kind(low)
+    if kind == "uncommitted":
+        return f"{prefix}{GIT_STATUS_SHORT} && git diff --stat"
     if kind == "status_log":
         return f"{prefix}{GIT_STATUS_SHORT} && git log -n {_recent_commit_count(low)} --oneline"
     if kind == "status":
@@ -460,15 +684,15 @@ def _repo_check_command(low: str) -> str | None:
         low,
         (
             "sonar", "cc", "prefly", "pyrefly", "pylance",
-            "check", "fix", "issue", "issues", "lint",
+            "lint", "issue", "issues",
         ),
-    ):
+    ) or ("check" in low and _GIT_STATUS not in low and "pytest" not in low
+          and "uncommitted" not in low and "uncommited" not in low):
         return (
             f"cd {MUSE2API_ROOT} && {GIT_STATUS_SHORT} && "
-            ".venv/bin/ruff check src tests && .venv/bin/pyrefly check src/ && "
-            ".venv/bin/pyright src/"
+            ".venv/bin/ruff check src tests && .venv/bin/pyrefly check src/"
         )
-    return f"cd {MUSE2API_ROOT} && {GIT_STATUS_SHORT}"
+    return None
 
 
 def _pytest_command(user_query: str) -> str | None:
@@ -478,39 +702,70 @@ def _pytest_command(user_query: str) -> str | None:
         return None
     rest = user_query[m.end():].split("\n", 1)[0]
     tail = re.sub(r"^\s+on\s+", " ", rest, flags=re.IGNORECASE).strip()
-    cmd = f"pytest {tail}"
-    cmd = re.sub(r"\s+(?:and|then|to|for|with)\s+.*$", "", cmd,
-                 flags=re.IGNORECASE).strip()
-    if not cmd.startswith(".venv"):
-        cmd = f".venv/bin/{cmd}"
-    return cmd
+    # Truncate at the first trailing keyword separator (linear scan, no backtracking).
+    _cut = len(tail)
+    _low_tail = tail.lower()
+    for _sep in (",", ";", " and", " then", " to", " for", " with"):
+        _idx = _low_tail.find(_sep)
+        if _idx != -1 and _idx < _cut:
+            _cut = _idx
+    tail = tail[:_cut].strip()
+    cmd = f".venv/bin/python -m pytest {tail}".strip()
+    low = user_query.lower()
+    prefix = _git_workspace_prefix(low)
+    if _GIT_STATUS in low:
+        return f"{prefix}{GIT_STATUS_SHORT} && {cmd}"
+    return f"{prefix}{cmd}"
+
+
+_SAFE_CMD_HEAD_RE = re.compile(
+    r"^(?:git|pytest|python(?:3)?|ruff|pyright|pyrefly|flake8|mypy|radon|uv|"
+    r"npm|npx|node|ls|cat|head|tail|grep|rg|find|\.?/|\.venv/)",
+    re.IGNORECASE,
+)
 
 
 def _run_command(user_query: str) -> str | None:
-    """A bare run/execute command mentioned in the query."""
+    """A bare run/execute command mentioned in the query (only real shell commands)."""
     m = re.search(r"\b(?:run|execute)\b", user_query, re.IGNORECASE)
     if m is None:
         return None
     rest = user_query[m.end():].split("\n", 1)[0].lstrip()
-    return rest or None
+    if not rest:
+        return None
+    if rest.startswith("`") and "`" in rest[1:]:
+        cmd = rest.split("`")[1].strip()
+        return cmd or None
+    if _SAFE_CMD_HEAD_RE.match(rest):
+        return rest
+    return None
 
 
 def _quality_repo_query(low: str) -> bool:
-    """True for queries about quality-tool output on a repository."""
-    return _mentions(low, _QUALITY_WORDS) and "repo" in low
+    """True for queries about quality-tool checks on a repository."""
+    return _mentions(low, _QUALITY_WORDS) and (
+        "repo" in low or _mentions(low, ("check", "issue", "issues", "pylance", "pyrefly", "prefly"))
+    )
 
 
 def _terminal_command(user_query: str) -> str | None:
-    """A shell command the user asked to run (pytest, git, run/execute, repo checks)."""
+    """A shell command the user asked to run (pytest, git, repo checks, run/execute)."""
     low = user_query.lower()
-    repo_cmd = _repo_check_command(low)
-    if repo_cmd:
-        return repo_cmd
-    if _quality_repo_query(low):
-        return GIT_STATUS_SHORT
     pytest_cmd = _pytest_command(user_query)
     if pytest_cmd:
         return pytest_cmd
+    repo_cmd = _repo_check_command(low)
+    if repo_cmd:
+        return repo_cmd
+    if _quality_repo_query(low) or "pylance_guard.py" in low:
+        if "muse2api" in low and not _mentions(low, ("pylance", "trading", "firm")):
+            cmd = ".venv/bin/python -m pytest -q && .venv/bin/ruff check src tests"
+        else:
+            cmd = ".venv/bin/python scripts/ops/pylance_guard.py"
+        prefix = _git_workspace_prefix(low)
+        if "git status" in low:
+            return f"{prefix}{GIT_STATUS_SHORT} && {cmd}"
+        return f"{prefix}{cmd}"
     cmd_git = _clean_git_command(user_query)
     if cmd_git:
         return cmd_git
@@ -518,15 +773,30 @@ def _terminal_command(user_query: str) -> str | None:
 
 
 def _refusal_file_path(text: str, user_query: str) -> str | None:
-    """A repo file path mentioned in the refusal or the user query."""
-    m_path = _FILE_PATH_RE.search(text) or _FILE_PATH_RE.search(user_query)
-    return m_path.group(1).strip() if m_path else None
+    """A repo file path mentioned in the user query or refusal."""
+    m_path = _FILE_PATH_RE.search(user_query) or _FILE_PATH_RE.search(text)
+    if not m_path:
+        return None
+    path = m_path.group(1).strip()
+    if not path.startswith("/"):
+        low = user_query.lower()
+        if TRADING_FIRM_ROOT.lower() in low or _mentions(low, ("trading", "firm", "options")):
+            return f"{TRADING_FIRM_ROOT}/{path}"
+        if "muse2api" in low:
+            return f"{MUSE2API_ROOT}/{path}"
+    return path
 
 
-def _terminal_fallback(norm_tools: dict[str, str], user_query: str,
+def _read_line_limit(user_query: str) -> int | None:
+    """Extract requested line limit such as 'first 15 lines' from query."""
+    m = re.search(r"\b(?:first|top|lines?)\s+(\d+)\s*(?:lines?)?\b", user_query, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _terminal_fallback(user_query: str,
                        available_tools: list[str]) -> list[dict[str, Any]] | None:
-    """Synthesize a terminal tool call when the user asked to run a command."""
-    terminal_tool = norm_tools.get("terminal")
+    """Synthesize a terminal/shell tool call when the user asked to run a command."""
+    terminal_tool = _pick_tool(available_tools, "terminal")
     if not terminal_tool:
         return None
     cmd = _terminal_command(user_query)
@@ -536,16 +806,20 @@ def _terminal_fallback(norm_tools: dict[str, str], user_query: str,
     return [c] if c else None
 
 
-def _read_file_fallback(norm_tools: dict[str, str], text: str, user_query: str,
+def _read_file_fallback(text: str, user_query: str,
                         available_tools: list[str]) -> list[dict[str, Any]] | None:
-    """Synthesize a read_file tool call for a repo path mentioned in the reply."""
-    read_tool = norm_tools.get("read_file")
+    """Synthesize a read/read_file tool call for a repo path mentioned in the reply."""
+    read_tool = _pick_tool(available_tools, "read_file")
     if not read_tool:
         return None
     path = _refusal_file_path(text, user_query)
     if not path:
         return None
-    c = _build_call_entry(read_tool, {"path": path}, available_tools)
+    args: dict[str, Any] = {"path": path}
+    limit = _read_line_limit(user_query)
+    if limit is not None:
+        args["limit"] = limit
+    c = _build_call_entry(read_tool, args, available_tools)
     return [c] if c else None
 
 
@@ -554,25 +828,32 @@ def _fallback_tool_from_refusal(
     user_query: str,
     available_tools: list[str] | None,
 ) -> list[dict[str, Any]] | None:
-    """When Muse outputs a web-chat refusal instead of calling a tool, synthesize the call."""
+    """When Muse outputs a web-chat refusal instead of calling a tool, synthesize calls."""
     if not available_tools or not text:
         return None
     if not is_refusal(text):
         return None
 
-    norm_tools = {t.lower(): t for t in available_tools}
-    return (
-        _terminal_fallback(norm_tools, user_query, available_tools)
-        or _read_file_fallback(norm_tools, text, user_query, available_tools)
+    term_calls = _terminal_fallback(user_query, available_tools) or []
+    wants_explicit_read = bool(
+        _FILE_PATH_RE.search(user_query)
+        and _mentions(user_query.lower(), ("read", "line", "lines", "inspect", "show", "head"))
     )
+    if not term_calls or wants_explicit_read:
+        read_calls = _read_file_fallback(text, user_query, available_tools) or []
+    else:
+        read_calls = []
+    combined = read_calls + term_calls
+    return combined or None
 
 
 def _bare_json_calls(
     text: str, available_tools: list[str] | None,
 ) -> list[dict[str, Any]] | None:
-    """Tool calls from a top-level JSON object, or None when not one."""
+    """Tool calls from a top-level JSON object or array, or None when not one."""
     stripped = text.strip()
-    if not (stripped.startswith("{") and stripped.endswith("}")):
+    if not ((stripped.startswith("{") and stripped.endswith("}"))
+            or (stripped.startswith("[") and stripped.endswith("]"))):
         return None
     payload = _safe_json_loads(stripped)
     if payload is None:
@@ -581,12 +862,53 @@ def _bare_json_calls(
     return calls or None
 
 
+def _embedded_json_calls(
+    text: str, available_tools: list[str] | None,
+) -> tuple[list[dict[str, Any]], str | None] | None:
+    """Extract JSON action objects/arrays rendered without ``` fences (e.g. DOM innerText)."""
+    decoder = json.JSONDecoder()
+    calls: list[dict[str, Any]] = []
+    kept: list[str] = []
+    pos = 0
+    length = len(text)
+    while pos < length:
+        brace = text.find("{", pos)
+        bracket = text.find("[", pos)
+        candidates = [i for i in (brace, bracket) if i >= 0]
+        if not candidates:
+            kept.append(text[pos:])
+            break
+        idx = min(candidates)
+        try:
+            payload, end_idx = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            kept.append(text[pos:idx + 1])
+            pos = idx + 1
+            continue
+        found = _calls_from_payload(payload, available_tools)
+        if not found:
+            kept.append(text[pos:end_idx])
+            pos = end_idx
+            continue
+        prefix = text[pos:idx]
+        # Strip rendered code-block label lines like "action\n" or "json\n" or "Copy\n"
+        prefix = re.sub(r"(?:^|\n)\s*(?:Copy\s+)?(?:action|json)\s*$", "", prefix, flags=re.IGNORECASE)
+        kept.append(prefix)
+        calls.extend(found)
+        pos = end_idx
+
+    if not calls:
+        return None
+    remaining = "".join(kept).strip() or None
+    return calls, remaining
+
+
 def extract_tool_calls(
     text: str,
     available_tools: list[str] | None = None,
     user_query: str = "",
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
-    """Parse tool calls from model output, with fallback synthesis on refusal."""
+    """Parse tool calls from model output, with optional fallback synthesis on refusal."""
     if not text:
         return None, text
 
@@ -598,7 +920,11 @@ def extract_tool_calls(
     if calls:
         return calls, None
 
-    # Fallback synthesis if model refused an actionable query
+    embedded = _embedded_json_calls(text, available_tools)
+    if embedded is not None:
+        return embedded
+
+    # Fallback synthesis if caller passed user_query and model refused an actionable query
     if user_query and available_tools:
         fallback = _fallback_tool_from_refusal(text, user_query, available_tools)
         if fallback:
@@ -669,11 +995,11 @@ def sanitize_response_text(text: str) -> str:
     return text.strip()
 
 
-def _collect_tool_history(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-    """Split the conversation history into tool outputs and tool-call summaries."""
+def _collect_from_turn_messages(turn_messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Collect tool outputs and call summaries from post-user messages."""
     tool_outputs: list[str] = []
     tool_calls: list[str] = []
-    for m in messages:
+    for m in turn_messages:
         if m.get("role") == "tool":
             c = m.get("content", "")
             if isinstance(c, str) and c.strip():
@@ -685,45 +1011,36 @@ def _collect_tool_history(messages: list[dict[str, Any]]) -> tuple[list[str], li
     return tool_outputs, tool_calls
 
 
-def _append_check(lines: list[str], *, condition: bool, text: str) -> None:
-    if condition:
-        lines.append(text)
+def _collect_tool_history(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Split current-turn tool outputs and tool-call summaries (after the last user message)."""
+    last_user_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "user":
+            last_user_idx = idx
+            break
+    turn_messages = messages[last_user_idx + 1:] if last_user_idx >= 0 else messages
+    return _collect_from_turn_messages(turn_messages)
 
 
 def _quality_report(tool_calls_str: str, latest_output: str) -> str | None:
-    """A synthesized answer for code-quality / static-analysis tool runs."""
+    """Summarize static-analysis output accurately without fabricating results."""
     mentions_toolchain = any(
         k in tool_calls_str for k in ("ruff", "pyrefly", "pyright", "flake8", "radon")
     )
-    low = latest_output.lower()
-    if not mentions_toolchain and "all checks passed" not in low:
+    if not mentions_toolchain and "all checks passed" not in latest_output.lower():
         return None
-    lines = ["I have accessed the repository on your machine and verified the code quality:\n"]
-    lines.append("### Code Quality & Static Analysis Results:")
-    _append_check(lines, condition="all checks passed" in low,
-                  text="- **Ruff / Flake8**: Passed (0 errors).")
-    _append_check(lines, condition="0 errors" in low,
-                  text="- **Pyrefly Type Diagnostics**: 0 errors.")
-    _append_check(lines, condition="0 warnings" in low or "0 errors, 0 warnings" in low,
-                  text="- **Pyright / Pylance**: 0 errors, 0 warnings.")
-    _append_check(
-        lines,
-        condition=any(w in latest_output for w in ("On branch", "M ", "?? ", "modified:")),
-        text="- **Git Status**: Repository accessible, working tree verified.",
-    )
-    lines.append("\nAll requested static checks, CC, and type checking diagnostics are clean.")
-    return "\n".join(lines)
+    return _execution_section("Code Quality & Execution Output", latest_output)
 
 
 def _execution_section(title: str, latest_output: str) -> str:
     """A fenced output section for pytest / file reads / general command runs."""
-    return f"### {title}:\n```\n{latest_output[:4000]}\n```"
+    return f"### {title}:\n```\n{latest_output[:8000]}\n```"
 
 
 _SECTION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("pytest", "passed in", "failed in"), "Test Execution Results"),
-    (("git ", "on branch", "commit ", "?? ", "m "), "Git Status & Commit History"),
-    (("read_file", "cat "), "File Contents"),
+    (("git ", "on branch", "commit ", "\n?? ", "\nm "), "Git Status & Commit History"),
+    (("read_file", "cat ", "\"total_lines\":"), "File Contents"),
 )
 
 
@@ -740,10 +1057,24 @@ def _tool_section_title(tool_calls_str: str, latest_output: str) -> str:
     return "Execution Output"
 
 
+_INSPECTION_TOOL_NAMES = frozenset({
+    "read", "read_file", "view_file", "cat",
+    "glob", "grep", "search_files", "find_files", "list_files",
+})
+
+
+def _has_only_inspection_calls(tool_calls: list[str]) -> bool:
+    """Return True when every recorded tool call is a read/search/list inspection."""
+    if not tool_calls:
+        return False
+    names = [tc.split(":", 1)[0].strip().lower() for tc in tool_calls]
+    return bool(names) and all(name in _INSPECTION_TOOL_NAMES for name in names)
+
+
 def synthesize_tool_response(messages: list[dict[str, Any]]) -> str:
     """Synthesize an answer when the model refused despite having tool execution results."""
     tool_outputs, tool_calls = _collect_tool_history(messages)
-    if not tool_outputs:
+    if not tool_outputs or _has_only_inspection_calls(tool_calls):
         return ""
 
     latest_output = "\n\n".join(tool_outputs)
@@ -800,7 +1131,133 @@ def _is_workspace_query(query: str) -> bool:
     return _mentions(q, _GIT_WORDS) or _mentions(q, _CODE_WORDS)
 
 
-def get_workspace_grounding(messages: list[dict[str, Any]]) -> str:
+_PROMISE_SUFFIX_RE = re.compile(
+    r"(?:applying|patching|editing|updating|writing|running|checking|fixing|inspecting)\b"
+    r"[^\n]{0,100}(?::|\bnow\b|\bnext\b|\bfirst\b)[^\n]{0,40}$",
+    re.IGNORECASE,
+)
+_MIDTASK_PROGRESS_RE = re.compile(
+    r"^(?:doing|starting|continuing|working on|applying|making|inspecting|checking|running)\b"
+    r"[^\n]{0,200}[.:]\s*$",
+    re.IGNORECASE,
+)
+_FAKE_EDIT_PHRASES = (
+    "have been edited on disk",
+    "edited on disk",
+    "fixed both",
+    "patched both",
+    "updated both files",
+    "both files have been",
+    "changes have been applied",
+    "edit has been applied",
+)
+
+
+_ACTION_TOOL_NAMES = frozenset({
+    "patch", "edit", "edit_file", "apply_patch",
+    "write_file", "write", "create_file",
+    "terminal", "shell", "bash", "execute",
+    "read_file", "read", "glob", "grep", "search_files",
+})
+
+_EDIT_TOOL_NAMES = frozenset({"patch", "write_file", "write", "edit", "edit_file"})
+
+_EDIT_WRITE_TOOL_PHRASE = "an edit/write tool"
+
+
+def _current_turn_used_edit_tool(messages: list[dict[str, Any]]) -> bool:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            break
+        for tc in m.get("tool_calls") or []:
+            name = (tc.get("function") or {}).get("name", "").lower()
+            if name in _EDIT_TOOL_NAMES:
+                return True
+    return False
+
+
+def _compute_tool_context(
+    available_tools: list[str],
+    stripped: str,
+    messages: list[dict[str, Any]],
+) -> tuple[str, str, str, str, list[str] | None]:
+    """Compute tool context for needs_tool_nudge.
+
+    Returns: (action_list, edit_list, example_tool, example_args, tool_outputs_or_None)
+    """
+    action = _preferred_action_tools(available_tools)
+    action_list = ", ".join(f"`{t}`" for t in action)
+    edit_tools = [t for c in ("patch", "write_file") if (t := _pick_tool(available_tools, c))]
+    edit_list = " or ".join(f"`{t}`" for t in edit_tools) or _EDIT_WRITE_TOOL_PHRASE
+    example_tool = _pick_tool(available_tools, "terminal") or action[0]
+    example_args = '{"command": "..."}' if example_tool in ("terminal", "shell", "bash") else "{}"
+
+    tool_outputs, _ = _collect_tool_history(messages) if is_refusal(stripped) else (None, None)
+
+    return action_list, edit_list, example_tool, example_args, tool_outputs
+
+
+def needs_tool_nudge(
+    text: str,
+    messages: list[dict[str, Any]],
+    available_tools: list[str] | None = None,
+) -> str | None:
+    """Return a correction prompt if Muse promised an action, refused mid-task, or faked an edit."""
+    if not text or not available_tools:
+        return None
+    norm = {t.lower() for t in available_tools}
+    if not (norm & _ACTION_TOOL_NAMES):
+        return None
+    stripped = text.strip()
+    low = stripped.lower()
+    if _PROMISE_SUFFIX_RE.search(stripped) or _MIDTASK_PROGRESS_RE.match(stripped):
+        return (
+            "You stopped after promising a next step without outputting the action JSON. "
+            "Output ONLY a ```action JSON block with the next action right now."
+        )
+    if _current_turn_used_edit_tool(messages):
+        return None
+
+    action_list, edit_list, example_tool, example_args, tool_outputs = _compute_tool_context(
+        available_tools, stripped, messages,
+    )
+
+    if "ran into a problem while responding" in low:
+        return (
+            "Please continue the user's request above: emit a ```action JSON block if a tool call "
+            f"({action_list}) is needed, or answer the user's question directly."
+        )
+    if is_refusal(stripped):
+        context_note = (
+            "The user's local Mac runner already returned Client Execution Output above. "
+            if tool_outputs
+            else ""
+        )
+        return (
+            "You are NOT pretending to have Mac access — `/Volumes` is only on the user's Mac, "
+            "not in your container. Your role here is to emit a structured ```action JSON request "
+            "so the user's local Mac client can execute it on their Mac and send you the real "
+            f"output. {context_note}"
+            f"Please output the next ```action JSON block using ({action_list}), for example:\n"
+            "```action\n"
+            f'{{"action": "{example_tool}", "args": {example_args}}}\n'
+            "```"
+        )
+    has_fake_claim = any(p in low for p in _FAKE_EDIT_PHRASES)
+    has_prose_file_dump = bool(re.search(r"(?:^|\n)File:\s*\S+", stripped) and "```" in stripped)
+    if has_fake_claim or has_prose_file_dump:
+        return (
+            f"No files were modified yet because no {edit_list} ```action block was emitted. "
+            f"Output ONLY a ```action JSON block for {edit_list} right now instead of pasting code."
+        )
+    return None
+
+
+def get_workspace_grounding(
+    messages: list[dict[str, Any]],
+    *,
+    tool_mode: bool = False,
+) -> str:
     """Fetch relevant local git & workspace context (files + commits) for the user query."""
     user_query = _last_user_query(messages)
     if not user_query or not _is_workspace_query(user_query):
@@ -813,7 +1270,7 @@ def get_workspace_grounding(messages: list[dict[str, Any]]) -> str:
     try:
         base = helper.get_default_workspace(user_query)
         paths = helper.find_local_paths(user_query, base_dir=base)
-        ctx = helper.build_context_for_paths(paths, prompt=user_query)
+        ctx = helper.build_context_for_paths(paths, prompt=user_query, tool_mode=tool_mode)
     except (AttributeError, TypeError, ValueError, OSError):
         log.debug("Workspace grounding fetch failed")
     else:
